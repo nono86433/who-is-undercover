@@ -682,7 +682,7 @@ async function handleExcelFileUpload(file) {
 function exportWordBankToExcel(onlyDefault = false) {
   if (!window.XLSX) {
     // 若無 XLSX 則直接觸發下載靜態檔案
-    window.location.href = "./誰是臥底_120組精選題庫.xlsx";
+    window.location.href = "./wordbank_120.xlsx";
     return;
   }
 
@@ -1605,7 +1605,7 @@ function renderWordBankTab() {
           </div>
 
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-            <a href="./誰是臥底_120組精選題庫.xlsx" download="誰是臥底_120組精選題庫.xlsx" id="btn-download-default-excel"
+            <a href="./wordbank_120.xlsx" download="誰是臥底_120組精選題庫.xlsx" id="btn-download-default-excel"
               class="py-2.5 px-4 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 text-xs font-bold text-center transition flex items-center justify-center gap-1.5">
               <span>📥 下載 120 組精選 Excel 文檔</span>
             </a>
