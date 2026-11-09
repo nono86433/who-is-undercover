@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-TW" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>誰是臥底 Online｜3~8人多機連線 & 雲端題庫系統</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- SheetJS (Excel .xlsx 匯入與匯出解析) -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- QRCode.js (房間掃碼加入) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <!-- PeerJS (免設定跨裝置 WebRTC 即時房間連線) -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&display=swap');
+    body {
+      font-family: 'Noto Sans TC', system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at top, #1e1b4b 0%, #090d16 55%, #020617 100%);
+      min-height: 100vh;
+    }
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0f172a;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 9999px;
+    }
+  </style>
+</head>
+<body class="text-slate-100 antialiased selection:bg-indigo-500 selection:text-white flex flex-col min-h-screen">
+
+  <!-- 頂部導覽列 -->
+  <header class="sticky top-0 z-40 backdrop-blur-xl bg-slate-950/80 border-b border-slate-800/80">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+      <!-- 品牌標誌 -->
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-2xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-xl shadow-lg shadow-indigo-500/30">
+          🕵️
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="text-lg font-extrabold tracking-tight text-white">誰是臥底 <span class="text-indigo-400">Online</span></h1>
+            <span id="nav-cloud-badge" class="px-2.5 py-0.5 rounded-full text-xs font-medium bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
+              連線就緒
+            </span>
+          </div>
+          <p class="text-[11px] text-slate-400">支援 3~8 人跨機同步看牌投票・雲端題庫與 Excel 匯入系統</p>
+        </div>
+      </div>
+
+      <!-- 導覽切換按鈕 -->
+      <nav class="flex flex-wrap items-center gap-1.5">
+        <button id="tab-btn-game" type="button">
+          <span>🎮 遊戲大廳</span>
+        </button>
+        <button id="tab-btn-wordbank" type="button">
+          <span>📚 題庫 & Excel</span>
+          <span id="nav-wb-count" class="px-1.5 py-0.5 rounded-md bg-slate-950/60 text-[11px] text-indigo-200 font-mono">120組</span>
+        </button>
+        <button id="tab-btn-cloud" type="button">
+          <span>☁️ 雲端設定</span>
+        </button>
+        <button id="tab-btn-rules" type="button">
+          <span>📖 遊戲規則</span>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <!-- 主內容區 -->
+  <main class="flex-1 max-w-6xl w-full mx-auto px-4 py-6">
+    <!-- 頁籤 1：遊戲大廳與房間 -->
+    <section id="tab-panel-game"></section>
+
+    <!-- 頁籤 2：題庫管理與 Excel 上傳/下載 -->
+    <section id="tab-panel-wordbank" class="hidden"></section>
+
+    <!-- 頁籤 3：雲端資料庫設定 -->
+    <section id="tab-panel-cloud" class="hidden"></section>
+
+    <!-- 頁籤 4：遊戲規則與部署說明 -->
+    <section id="tab-panel-rules" class="hidden">
+      <div class="max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div class="p-6 rounded-3xl bg-slate-900/90 border border-slate-800 shadow-xl space-y-4">
+          <h2 class="text-xl font-bold text-white">🕵️ 《誰是臥底》3~8人遊戲規則</h2>
+          <div class="space-y-3 text-sm text-slate-300 leading-relaxed">
+            <div class="p-3.5 rounded-2xl bg-slate-950 border border-slate-800">
+              <strong class="text-sky-300 block mb-1">1. 身分與發牌（平民 / 臥底 / 白板）</strong>
+              多數玩家為「平民」，會拿到同一個詞語（如：<em>滷肉飯</em>）；少數玩家為「臥底」，會拿到高度相似的詞語（如：<em>肉燥飯</em>）。若開啟「白板」角色，白板玩家不會拿到任何詞語。所有人在結束前都不知道自己是平民還是臥底！
+            </div>
+            <div class="p-3.5 rounded-2xl bg-slate-950 border border-slate-800">
+              <strong class="text-amber-300 block mb-1">2. 輪流一句話描述</strong>
+              每輪每位存活玩家依序用一句話形容自己的詞語。規則：<strong class="text-white">不能直接說出詞語中包含的字</strong>，既要讓同夥聽出你是自己人，又不能讓臥底或白板輕易猜出你的詞！
+            </div>
+            <div class="p-3.5 rounded-2xl bg-slate-950 border border-slate-800">
+              <strong class="text-rose-300 block mb-1">3. 全員手機同步投票</strong>
+              每輪描述結束後，大家在自己的手機上點擊懷疑的對象進行投票。得票最高者淘汰出局（若最高票平手則進行 PK 重投）。
+            </div>
+            <div class="p-3.5 rounded-2xl bg-slate-950 border border-slate-800">
+              <strong class="text-emerald-300 block mb-1">4. 勝負判定條件</strong>
+              <ul class="list-disc list-inside space-y-1 text-xs text-slate-300 mt-1">
+                <li><strong>平民勝利</strong>：將場上所有臥底與白板全數投票淘汰！</li>
+                <li><strong>臥底勝利</strong>：臥底存活到場上剩餘總人數 ≤ 2 人，或平民人數 ≤ 臥底人數。</li>
+                <li><strong>白板勝利</strong>：臥底皆已出局，但白板憑藉演技存活到最後！</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="p-6 rounded-3xl bg-slate-900/90 border border-slate-800 shadow-xl space-y-4">
+          <h2 class="text-xl font-bold text-white">☁️ 題庫擴充、Excel 上傳與網路保存說明</h2>
+          <div class="space-y-3 text-sm text-slate-300 leading-relaxed">
+            <div class="p-3.5 rounded-2xl bg-slate-950 border border-slate-800">
+              <strong class="text-indigo-300 block mb-1">📊 兩兩一組 Excel 文檔直接上傳</strong>
+              專案內附 <code>誰是臥底_120組精選題庫.xlsx</code>，您可於「題庫 & Excel」頁籤隨時下載該檔案，在 Excel 中新增兩兩一組的相似詞語後，直接拖曳上傳至網頁，系統會自動去重並匯入！
+            </div>
+            <div class="p-3.5 rounded-2xl bg-slate-950 border border-slate-800">
+              <strong class="text-emerald-300 block mb-1">🌐 部署至 GitHub Pages / Vercel 與雲端持久化</strong>
+              本專案為 100% 純前端架構，可直接將資料夾推送至 GitHub Pages、Vercel 或 Netlify 免費託管。<br/>
+              於「☁️ 雲端設定」貼上您的免費 Firebase Realtime Database 網址（或寫入 <code>config.js</code>），任何時候在網頁上新增或上傳 Excel 的題庫都會<strong>永久保存在雲端網路上</strong>！
+            </div>
+            <div class="p-3.5 rounded-2xl bg-slate-950 border border-slate-800">
+              <strong class="text-purple-300 block mb-1">📱 多機連線雙引擎保障</strong>
+              支援 <strong>Firebase 雲端同步</strong> 與 <strong>WebRTC (PeerJS) 點對點連線</strong> 雙引擎。就算尚未設定雲端資料庫，朋友直接用手機掃描房間 QR Code 或輸入 4 碼房號也能跨網路連線遊玩！
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 底部資訊列 -->
+  <footer class="py-4 border-t border-slate-900 text-center text-xs text-slate-500">
+    誰是臥底 Online ・ 內建 120 組精選高相似度題庫 ・ 支援 Excel (.xlsx) 雙向匯入匯出與雲端持久化
+  </footer>
+
+  <!-- 浮動通知容器 -->
+  <div id="toast-container" class="fixed bottom-5 right-5 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none px-4 sm:px-0"></div>
+
+  <!-- 核心腳本載入 -->
+  <script src="./words_data.js"></script>
+  <script src="./config.js"></script>
+  <script src="./cloud_service.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
+
