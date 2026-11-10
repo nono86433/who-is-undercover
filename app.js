@@ -14,6 +14,10 @@ const AppState = {
   // 若房主在同機新增「本機代管玩家」方便單機或少手機混玩時切換視角
   viewingPlayerId: "",
 
+  // 房間內展開修改個人暱稱與頭像面板
+  isEditingProfileInRoom: false,
+  roomDraftAvatar: "",
+
   // 房間狀態 (與雲端/PeerJS 同步)
   room: null,
 
@@ -91,7 +95,7 @@ function savePlayerProfile(name, avatar) {
 }
 
 // ============================================================================
-// 房間建立、加入與房主權威狀態機 (3~8 人支援)
+// 房間建立、加入與房主權威狀態機 (3~20 人支援 + 思考秒數倒數)
 // ============================================================================
 
 function createInitialRoomState(roomCode, hostPlayer) {
@@ -101,6 +105,8 @@ function createInitialRoomState(roomCode, hostPlayer) {
     phase: "LOBBY", // "LOBBY" | "SPEAKING" | "VOTING" | "GAME_OVER"
     round: 1,
     settings: {
+      maxPlayers: 8,           // 可自由調整 3 ~ 20 人
+      thinkingTimeSeconds: 30, // 每人思考發言秒數 (0 代表不限時)
       undercoverCount: 1,
       blankCount: 0,
       category: "ALL",
@@ -124,6 +130,8 @@ function createInitialRoomState(roomCode, hostPlayer) {
     currentWordPair: null, // { id, civilianWord, undercoverWord, category, hint }
     speakingOrder: [],     // array of playerIds
     currentSpeakerIdx: 0,
+    speakerDeadline: null, // 當前發言者思考截止時間戳 (ms)
+    speakerTotalSeconds: 30,
     clues: [],             // [{ round, playerId, playerName, playerAvatar, text, time }]
     voteTieCandidates: [], // 若平票 PK 時限定可投對象
     voteHistory: [],       // [{ round, votes: { voterId: targetId }, eliminatedId, isTie }]
@@ -133,18 +141,23 @@ function createInitialRoomState(roomCode, hostPlayer) {
   };
 }
 
-// 依據玩家人數自動計算建議的臥底與白板數量 (3~8人)
+// 依據玩家人數自動計算建議的臥底與白板數量 (支援 3~20人)
 function getRecommendedRoleCounts(playerCount) {
-  if (playerCount <= 3) return { undercover: 1, blank: 0 };
-  if (playerCount <= 5) return { undercover: 1, blank: 0 };
+  if (playerCount <= 4) return { undercover: 1, blank: 0 };
   if (playerCount <= 6) return { undercover: 1, blank: 1 };
-  return { undercover: 2, blank: 1 }; // 7~8人
+  if (playerCount <= 8) return { undercover: 2, blank: 1 };
+  if (playerCount <= 11) return { undercover: 3, blank: 1 };
+  if (playerCount <= 14) return { undercover: 4, blank: 1 };
+  if (playerCount <= 17) return { undercover: 5, blank: 2 };
+  return { undercover: 6, blank: 2 }; // 18~20人
 }
 
 function clampRoleSettings(playerCount, settings) {
-  const count = Math.max(3, Math.min(8, playerCount));
-  let uc = parseInt(settings.undercoverCount, 10) || 1;
-  let blank = parseInt(settings.blankCount, 10) || 0;
+  const count = Math.max(3, Math.min(20, playerCount));
+  let uc = parseInt(settings.undercoverCount, 10);
+  if (isNaN(uc)) uc = 1;
+  let blank = parseInt(settings.blankCount, 10);
+  if (isNaN(blank)) blank = 0;
 
   // 臥底至少 1 人，且 (臥底 + 白板) 必須小於總人數的一半 (3人局例外：2平民 + 1臥底)
   const maxSpecial = count === 3 ? 1 : Math.floor((count - 1) / 2);
@@ -155,6 +168,18 @@ function clampRoleSettings(playerCount, settings) {
     blank = Math.max(0, maxSpecial - uc);
   }
   return { undercoverCount: uc, blankCount: blank };
+}
+
+function resetSpeakerTimer(room, extraSeconds = 0) {
+  const baseSec = Math.max(0, parseInt(room.settings.thinkingTimeSeconds ?? 30, 10) || 0);
+  if (baseSec <= 0 && extraSeconds <= 0) {
+    room.speakerDeadline = null;
+    room.speakerTotalSeconds = 0;
+    return;
+  }
+  const totalSec = baseSec + extraSeconds;
+  room.speakerTotalSeconds = totalSec;
+  room.speakerDeadline = Date.now() + totalSec * 1000;
 }
 
 // 房主處理所有玩家發送過來的 Action
@@ -171,9 +196,13 @@ function handleHostAction(action) {
         existing.name = p.name || existing.name;
         existing.avatar = p.avatar || existing.avatar;
       } else {
-        if (room.players.length >= 8) {
-          // 房間已滿 8 人
+        const maxAllowed = Math.max(3, Math.min(20, parseInt(room.settings.maxPlayers, 10) || 8));
+        if (room.players.length >= 20) {
           break;
+        }
+        // 若實際加入人數超過原本設定的座位數 (且未滿 20 人)，自動擴充座位上限
+        if (room.players.length >= maxAllowed && room.players.length < 20) {
+          room.settings.maxPlayers = room.players.length + 1;
         }
         if (room.phase !== "LOBBY") {
           // 遊戲進行中加入視為觀戰或等待下一局
@@ -214,18 +243,69 @@ function handleHostAction(action) {
     case "UPDATE_PLAYER_PROFILE": {
       const target = room.players.find(x => x.id === action.playerId);
       if (target) {
-        target.name = action.name || target.name;
-        target.avatar = action.avatar || target.avatar;
+        if (action.name && String(action.name).trim()) {
+          target.name = String(action.name).trim().slice(0, 12);
+        }
+        if (action.avatar) {
+          target.avatar = action.avatar;
+        }
+        // 同步更新歷史發言紀錄中的名稱與頭像
+        if (Array.isArray(room.clues)) {
+          room.clues.forEach(c => {
+            if (c.playerId === target.id) {
+              c.playerName = target.name;
+              c.playerAvatar = target.avatar;
+            }
+          });
+        }
       }
       break;
     }
 
+    case "LEAVE_ROOM":
     case "REMOVE_PLAYER": {
-      if (room.phase !== "LOBBY") break;
-      room.players = room.players.filter(x => x.id !== action.playerId || x.isHost);
-      const clamped = clampRoleSettings(room.players.length, room.settings);
-      room.settings.undercoverCount = clamped.undercoverCount;
-      room.settings.blankCount = clamped.blankCount;
+      const targetId = action.playerId;
+      if (!targetId) break;
+      const leavingPlayer = room.players.find(x => x.id === targetId && !x.isHost);
+      if (!leavingPlayer) break;
+
+      room.players = room.players.filter(x => x.id !== targetId || x.isHost);
+
+      if (room.phase === "LOBBY") {
+        const clamped = clampRoleSettings(room.players.length, room.settings);
+        room.settings.undercoverCount = clamped.undercoverCount;
+        room.settings.blankCount = clamped.blankCount;
+      } else if (room.phase === "SPEAKING" || room.phase === "VOTING") {
+        const currentSpeakerId = room.speakingOrder[room.currentSpeakerIdx];
+        const removedSpeakerIdx = room.speakingOrder.indexOf(targetId);
+        if (removedSpeakerIdx !== -1) {
+          room.speakingOrder.splice(removedSpeakerIdx, 1);
+          if (removedSpeakerIdx < room.currentSpeakerIdx) {
+            room.currentSpeakerIdx = Math.max(0, room.currentSpeakerIdx - 1);
+          } else if (room.currentSpeakerIdx >= room.speakingOrder.length) {
+            room.currentSpeakerIdx = Math.max(0, room.speakingOrder.length - 1);
+          }
+        }
+        if (room.voteTieCandidates) {
+          room.voteTieCandidates = room.voteTieCandidates.filter(id => id !== targetId);
+        }
+
+        // 若剩餘玩家不足 2 人或已達成勝負條件
+        const winCheck = evaluateVictoryCondition(room);
+        if (winCheck.isOver) {
+          room.phase = "GAME_OVER";
+          room.winner = winCheck.winner;
+          room.winReason = winCheck.reason;
+          room.speakerDeadline = null;
+        } else if (room.phase === "SPEAKING" && currentSpeakerId === targetId) {
+          resetSpeakerTimer(room);
+        } else if (room.phase === "VOTING") {
+          const allAliveVoted = room.players.filter(x => x.alive).every(x => !!x.votedFor);
+          if (allAliveVoted && room.players.filter(x => x.alive).length > 0) {
+            resolveVotingRound(room);
+          }
+        }
+      }
       break;
     }
 
@@ -235,7 +315,30 @@ function handleHostAction(action) {
         ...room.settings,
         ...action.settings
       };
-      const clamped = clampRoleSettings(room.players.length, room.settings);
+      // 正規化房間人數上限 (3 ~ 20 人)
+      let maxP = parseInt(room.settings.maxPlayers, 10);
+      if (isNaN(maxP)) maxP = 8;
+      maxP = Math.max(3, Math.min(20, maxP));
+
+      // 若調低人數上限且場上有超額的本機測試座位，自動移除多餘的本機測試座位
+      while (room.players.length > maxP) {
+        const lastBotIdx = room.players.map(p => p.isLocalBot).lastIndexOf(true);
+        if (lastBotIdx !== -1) {
+          room.players.splice(lastBotIdx, 1);
+        } else {
+          maxP = room.players.length;
+          break;
+        }
+      }
+      room.settings.maxPlayers = maxP;
+
+      // 正規化每人思考秒數 (0 ~ 300 秒)
+      let thinkSec = parseInt(room.settings.thinkingTimeSeconds, 10);
+      if (isNaN(thinkSec) || thinkSec < 0) thinkSec = 0;
+      if (thinkSec > 300) thinkSec = 300;
+      room.settings.thinkingTimeSeconds = thinkSec;
+
+      const clamped = clampRoleSettings(Math.max(room.players.length, 3), room.settings);
       room.settings.undercoverCount = clamped.undercoverCount;
       room.settings.blankCount = clamped.blankCount;
       break;
@@ -263,11 +366,17 @@ function handleHostAction(action) {
           time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
         });
       }
-      // 若是當前發言者送出描述，自動推進至下一位發言者
+      // 若是當前發言者送出描述，自動推進至下一位發言者並重設思考計時
       const currentSpeakerId = room.speakingOrder[room.currentSpeakerIdx];
       if (currentSpeakerId === p.id) {
         if (room.currentSpeakerIdx < room.speakingOrder.length - 1) {
           room.currentSpeakerIdx++;
+          resetSpeakerTimer(room);
+        } else {
+          room.phase = "VOTING";
+          room.speakerDeadline = null;
+          room.voteTieCandidates = [];
+          room.players.forEach(pl => { pl.votedFor = null; });
         }
       }
       break;
@@ -276,17 +385,31 @@ function handleHostAction(action) {
     case "NEXT_SPEAKER": {
       if (room.currentSpeakerIdx < room.speakingOrder.length - 1) {
         room.currentSpeakerIdx++;
+        resetSpeakerTimer(room);
       } else {
         // 全員發言完畢，進入投票階段
         room.phase = "VOTING";
+        room.speakerDeadline = null;
         room.voteTieCandidates = [];
         room.players.forEach(p => { p.votedFor = null; });
       }
       break;
     }
 
+    case "EXTEND_SPEAKER_TIME": {
+      if (room.phase === "SPEAKING") {
+        const extra = parseInt(action.seconds, 10) || 15;
+        const now = Date.now();
+        const base = (room.speakerDeadline && room.speakerDeadline > now) ? room.speakerDeadline : now;
+        room.speakerDeadline = base + extra * 1000;
+        room.speakerTotalSeconds = (room.speakerTotalSeconds || 30) + extra;
+      }
+      break;
+    }
+
     case "START_VOTING": {
       room.phase = "VOTING";
+      room.speakerDeadline = null;
       room.voteTieCandidates = [];
       room.players.forEach(p => { p.votedFor = null; });
       break;
@@ -327,8 +450,8 @@ function startNewGameRound() {
   if (!AppState.room || AppState.room.hostId !== AppState.myPlayer.id) return;
   const room = JSON.parse(JSON.stringify(AppState.room));
 
-  if (room.players.length < 3 || room.players.length > 8) {
-    showToast("遊戲人數需為 3 ~ 8 人！目前為 " + room.players.length + " 人", "warning");
+  if (room.players.length < 3 || room.players.length > 20) {
+    showToast("遊戲人數需為 3 ~ 20 人！目前為 " + room.players.length + " 人", "warning");
     return;
   }
 
@@ -439,6 +562,7 @@ function setupSpeakingOrderForRound(room, avoidBlankFirst = false) {
   }
   room.speakingOrder = order;
   room.currentSpeakerIdx = 0;
+  resetSpeakerTimer(room);
 }
 
 // 結算投票與勝負判定
@@ -851,6 +975,7 @@ function renderGameTab() {
   if (!container) return;
 
   if (!AppState.room) {
+    stopSpeakerCountdownTicker();
     container.innerHTML = renderLobbyHomeHtml();
     bindLobbyHomeEvents();
     return;
@@ -860,15 +985,51 @@ function renderGameTab() {
   const isHost = room.hostId === AppState.myPlayer.id;
   const viewingPlayer = getActiveViewingPlayer();
   const localBots = room.players.filter(p => p.id === AppState.myPlayer.id || p.isLocalBot);
+  const maxPlayers = Math.max(3, Math.min(20, parseInt(room.settings.maxPlayers, 10) || 8));
 
   let phaseHtml = "";
   if (room.phase === "LOBBY") {
-    phaseHtml = renderRoomWaitingHtml(room, isHost);
+    phaseHtml = renderRoomWaitingHtml(room, isHost, viewingPlayer);
   } else if (room.phase === "SPEAKING" || room.phase === "VOTING") {
     phaseHtml = renderInGameHtml(room, isHost, viewingPlayer);
   } else if (room.phase === "GAME_OVER") {
     phaseHtml = renderGameOverHtml(room, isHost, viewingPlayer);
   }
+
+  // 房間內隨時展開修改個人暱稱與頭像面板
+  const draftAv = AppState.roomDraftAvatar || viewingPlayer.avatar;
+  const editProfilePanelHtml = AppState.isEditingProfileInRoom ? `
+    <div class="mb-4 p-4 rounded-2xl bg-slate-900 border border-indigo-500/50 shadow-xl">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-bold text-white flex items-center gap-2">
+          <span>✏️ 修改房間內顯示暱稱與頭像</span>
+          <span class="text-xs text-indigo-300 font-normal">（修改後全員畫面即時同步）</span>
+        </div>
+        <button id="btn-cancel-room-profile" type="button" class="text-xs text-slate-400 hover:text-white">✕ 關閉</button>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-12 gap-3 items-center">
+        <div class="md:col-span-4">
+          <input id="input-room-player-name" type="text" maxlength="12" value="${escapeHtml(viewingPlayer.name)}"
+            placeholder="輸入新暱稱..."
+            class="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm focus:outline-none focus:border-indigo-500" />
+        </div>
+        <div class="md:col-span-6 flex flex-wrap gap-1.5">
+          ${AVATARS.map(av => `
+            <button type="button" data-room-avatar-pick="${av}"
+              class="w-9 h-9 rounded-xl text-lg flex items-center justify-center border transition ${draftAv === av ? "bg-indigo-600/30 border-indigo-400 scale-105 shadow" : "bg-slate-950 border-slate-800 hover:bg-slate-800"}">
+              ${av}
+            </button>
+          `).join("")}
+        </div>
+        <div class="md:col-span-2 flex justify-end">
+          <button id="btn-save-room-profile" type="button"
+            class="w-full py-2 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow transition">
+            💾 儲存修改
+          </button>
+        </div>
+      </div>
+    </div>
+  ` : "";
 
   // 若房主有新增同機玩家，提供視角切換器方便同機輪流看牌/投票
   const switcherHtml = (isHost && localBots.length > 1) ? `
@@ -897,13 +1058,17 @@ function renderGameTab() {
           </div>
           <div>
             <div class="text-sm font-semibold text-white flex items-center gap-2">
-              <span>目前人數：${room.players.length} / 8 人</span>
+              <span>目前人數：${room.players.length} / ${maxPlayers} 人</span>
               <span class="px-2 py-0.5 rounded-md text-xs ${room.phase === "LOBBY" ? "bg-emerald-500/20 text-emerald-300" : "bg-amber-500/20 text-amber-300"}">
                 ${room.phase === "LOBBY" ? "等候準備中" : room.phase === "SPEAKING" ? `第 ${room.round} 輪・發言描述` : room.phase === "VOTING" ? `第 ${room.round} 輪・全民投票` : "本局結算"}
               </span>
             </div>
-            <div class="text-xs text-slate-400 mt-0.5">
-              您的身分：${escapeHtml(viewingPlayer.avatar)} <strong class="text-slate-200">${escapeHtml(viewingPlayer.name)}</strong> ${isHost ? '<span class="text-amber-400">(房主)</span>' : ""}
+            <div class="text-xs text-slate-400 mt-1 flex flex-wrap items-center gap-2">
+              <span>您的身分：${escapeHtml(viewingPlayer.avatar)} <strong class="text-slate-200">${escapeHtml(viewingPlayer.name)}</strong> ${isHost ? '<span class="text-amber-400">(房主)</span>' : ""}</span>
+              <button id="btn-toggle-room-profile" type="button"
+                class="px-2 py-0.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/35 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
+                ✏️ 改名/換頭像
+              </button>
             </div>
           </div>
         </div>
@@ -922,6 +1087,7 @@ function renderGameTab() {
         </div>
       </div>
 
+      ${editProfilePanelHtml}
       ${switcherHtml}
       ${phaseHtml}
     </div>
@@ -929,7 +1095,12 @@ function renderGameTab() {
 
   bindRoomEvents();
   if (room.phase === "LOBBY") {
+    stopSpeakerCountdownTicker();
     renderQRCodeIfNeeded();
+  } else if (room.phase === "SPEAKING") {
+    startSpeakerCountdownTicker();
+  } else {
+    stopSpeakerCountdownTicker();
   }
 }
 
@@ -946,7 +1117,7 @@ function renderLobbyHomeHtml() {
           <h2 class="text-xl font-bold text-white mb-4">個人暱稱與頭像</h2>
 
           <div class="mb-4">
-            <label class="block text-xs font-medium text-slate-400 mb-1.5">您的遊戲暱稱</label>
+            <label class="block text-xs font-medium text-slate-400 mb-1.5">您的遊戲暱稱（進房後也可隨時修改）</label>
             <input id="input-player-name" type="text" maxlength="12" value="${escapeHtml(p.name)}"
               placeholder="輸入暱稱..."
               class="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white focus:outline-none focus:border-indigo-500 text-sm" />
@@ -966,7 +1137,7 @@ function renderLobbyHomeHtml() {
         </div>
 
         <div class="p-3.5 rounded-2xl bg-slate-950/80 border border-slate-800/80 text-xs text-slate-400 leading-relaxed">
-          💡 <strong class="text-slate-200">支援 3 ~ 8 人遊玩</strong>：每人用自己的手機掃描房主 QR Code 或輸入 4 碼房號即可同步看牌與投票！
+          💡 <strong class="text-slate-200">支援 3 ~ 20 人遊玩</strong>：每人用自己的手機掃描房主 QR Code 或輸入 4 碼房號即可同步看牌與投票！
         </div>
       </div>
 
@@ -979,9 +1150,9 @@ function renderLobbyHomeHtml() {
               <span class="inline-block px-3 py-1 rounded-full bg-indigo-500/20 text-indigo-300 text-xs font-semibold mb-2">
                 房主專用
               </span>
-              <h3 class="text-xl font-bold text-white mb-1">建立新遊戲房間 (3~8人)</h3>
+              <h3 class="text-xl font-bold text-white mb-1">建立新遊戲房間 (3~20人)</h3>
               <p class="text-xs text-slate-300 leading-relaxed mb-5">
-                建立房間後會產生專屬 4 碼房號與 QR Code，朋友掃碼即可加入。可自訂臥底人數、白板人數與題庫分類！
+                建立房間後會產生專屬 4 碼房號與 QR Code，朋友掃碼即可加入。可自由調整房間人數 (3~20人)、每人思考秒數、臥底與白板人數！
               </p>
             </div>
             <div class="text-4xl">👑</div>
@@ -1014,57 +1185,75 @@ function renderLobbyHomeHtml() {
   `;
 }
 
-function renderRoomWaitingHtml(room, isHost) {
+function renderRoomWaitingHtml(room, isHost, viewingPlayer) {
   const categories = getAvailableCategories();
   const count = room.players.length;
+  const maxPlayers = Math.max(3, Math.min(20, parseInt(room.settings.maxPlayers, 10) || 8));
+  const thinkSec = parseInt(room.settings.thinkingTimeSeconds ?? 30, 10) || 0;
   const ucCount = room.settings.undercoverCount;
   const blankCount = room.settings.blankCount;
   const civCount = Math.max(1, count - ucCount - blankCount);
 
   return `
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
-      <!-- 左側：房間玩家座位表 (3~8人) & QR Code -->
-      <div class="lg:col-span-7 p-6 rounded-3xl bg-slate-900/90 border border-slate-800 shadow-xl">
-        <div class="flex items-center justify-between mb-4">
-          <div>
-            <h3 class="text-lg font-bold text-white">房間玩家列表 (${count} / 8 人)</h3>
-            <p class="text-xs text-slate-400">滿 3 人即可開始遊戲，最多支援 8 人同樂</p>
+      <!-- 左側：房間玩家座位表 (3~20人) & QR Code -->
+      <div class="lg:col-span-7 p-6 rounded-3xl bg-slate-900/90 border border-slate-800 shadow-xl flex flex-col justify-between">
+        <div>
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+            <div>
+              <h3 class="text-lg font-bold text-white">房間玩家列表 (${count} / ${maxPlayers} 人)</h3>
+              <p class="text-xs text-slate-400">支援 3 ~ 20 人同樂・玩家離開房間會自動釋出座位</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <button id="btn-quick-edit-name" type="button"
+                class="px-3 py-1.5 rounded-xl text-xs font-semibold bg-indigo-500/20 hover:bg-indigo-500/35 text-indigo-300 border border-indigo-500/40 transition">
+                ✏️ 修改我的名字
+              </button>
+              ${isHost && count < 20 ? `
+                <button id="btn-add-local-player"
+                  class="px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/30 transition">
+                  + 新增同機測試座位
+                </button>
+              ` : ""}
+            </div>
           </div>
-          ${isHost && count < 8 ? `
-            <button id="btn-add-local-player"
-              class="px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-indigo-300 border border-indigo-500/30 transition">
-              + 新增同機玩家/測試座位
-            </button>
-          ` : ""}
-        </div>
 
-        <!-- 8 個座位網格 -->
-        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
-          ${Array.from({ length: 8 }).map((_, idx) => {
-            const p = room.players[idx];
-            if (p) {
-              return `
-                <div class="relative p-3.5 rounded-2xl bg-slate-950 border ${p.id === AppState.myPlayer.id ? "border-indigo-500/70" : "border-slate-800"} flex flex-col items-center text-center">
-                  <span class="absolute top-2 left-2.5 text-[10px] font-mono text-slate-500">#${idx + 1}</span>
-                  ${p.isHost ? `<span class="absolute top-2 right-2.5 text-xs" title="房主">👑</span>` : (isHost ? `
-                    <button data-kick-player="${escapeHtml(p.id)}" class="absolute top-1.5 right-2 text-slate-500 hover:text-rose-400 text-xs" title="移除此玩家">✕</button>
-                  ` : "")}
-                  <div class="text-3xl mb-1.5 mt-1">${escapeHtml(p.avatar)}</div>
-                  <div class="text-sm font-bold text-white truncate w-full">${escapeHtml(p.name)}</div>
-                  <div class="text-[11px] mt-1 ${p.isLocalBot ? "text-amber-400" : "text-emerald-400"}">
-                    ${p.isLocalBot ? "同機座位" : "已連線"}
+          <!-- 動態座位網格 (3 ~ 20 個座位) -->
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6 max-h-[420px] overflow-y-auto pr-1">
+            ${Array.from({ length: maxPlayers }).map((_, idx) => {
+              const p = room.players[idx];
+              if (p) {
+                const isMe = p.id === viewingPlayer.id;
+                return `
+                  <div class="relative p-3 rounded-2xl bg-slate-950 border ${isMe ? "border-indigo-500/80 ring-1 ring-indigo-500/40" : "border-slate-800"} flex flex-col items-center text-center">
+                    <span class="absolute top-2 left-2.5 text-[10px] font-mono text-slate-500">#${idx + 1}</span>
+                    ${p.isHost ? `<span class="absolute top-2 right-2.5 text-xs" title="房主">👑</span>` : (isHost ? `
+                      <button data-kick-player="${escapeHtml(p.id)}" class="absolute top-1.5 right-2 text-slate-500 hover:text-rose-400 text-xs" title="移除此玩家">✕</button>
+                    ` : "")}
+                    <div class="text-3xl mb-1 mt-1">${escapeHtml(p.avatar)}</div>
+                    <div class="text-sm font-bold text-white truncate w-full">${escapeHtml(p.name)}</div>
+                    <div class="flex items-center gap-1.5 mt-1">
+                      <span class="text-[11px] ${p.isLocalBot ? "text-amber-400" : "text-emerald-400"}">
+                        ${p.isLocalBot ? "同機座位" : "已連線"}
+                      </span>
+                      ${isMe ? `
+                        <button type="button" data-open-profile-edit="1" class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/40">
+                          改名
+                        </button>
+                      ` : ""}
+                    </div>
                   </div>
-                </div>
-              `;
-            } else {
-              return `
-                <div class="p-3.5 rounded-2xl bg-slate-950/40 border border-dashed border-slate-800 flex flex-col items-center justify-center text-center min-h-[112px]">
-                  <div class="text-xl text-slate-700 mb-1">🪑</div>
-                  <div class="text-xs text-slate-600">等待加入 (${idx + 1})</div>
-                </div>
-              `;
-            }
-          }).join("")}
+                `;
+              } else {
+                return `
+                  <div class="p-3 rounded-2xl bg-slate-950/40 border border-dashed border-slate-800 flex flex-col items-center justify-center text-center min-h-[104px]">
+                    <div class="text-xl text-slate-700 mb-1">🪑</div>
+                    <div class="text-xs text-slate-600">等待加入 (${idx + 1})</div>
+                  </div>
+                `;
+              }
+            }).join("")}
+          </div>
         </div>
 
         <!-- 掃碼與連線提示區 -->
@@ -1073,39 +1262,97 @@ function renderRoomWaitingHtml(room, isHost) {
           <div class="text-center sm:text-left">
             <div class="text-sm font-bold text-white mb-1">📱 邀請朋友用手機加入房間</div>
             <p class="text-xs text-slate-400 leading-relaxed mb-2">
-              請朋友使用手機相機掃描左側 QR Code，或打開本網頁輸入房號 <strong class="text-indigo-400 font-mono text-sm">${escapeHtml(room.roomCode)}</strong> 即可同步連線看牌！
+              請朋友使用手機相機掃描左側 QR Code，或打開本網頁輸入房號 <strong class="text-indigo-400 font-mono text-sm">${escapeHtml(room.roomCode)}</strong> 即可同步連線看牌！進入房間後點擊上方「✏️ 修改我的名字」即可隨時改名。
             </p>
-            <div class="text-[11px] text-slate-500">
-              提示：若想在同一台電腦測試多人連線，可直接開啟多個瀏覽器分頁輸入房號加入，或點擊右上角「+ 新增同機玩家」。
-            </div>
           </div>
         </div>
       </div>
 
-      <!-- 右側：角色配置與題庫設定 -->
+      <!-- 右側：人數上限、思考秒數與角色配置 -->
       <div class="lg:col-span-5 p-6 rounded-3xl bg-slate-900/90 border border-slate-800 shadow-xl flex flex-col justify-between">
         <div>
-          <h3 class="text-lg font-bold text-white mb-1">遊戲規則與角色配置</h3>
-          <p class="text-xs text-slate-400 mb-5">${isHost ? "您是房主，可自由調整臥底與白板人數" : "等待房主調整設定並開始遊戲"}</p>
+          <div class="flex items-center justify-between mb-1">
+            <h3 class="text-lg font-bold text-white">遊戲規則與角色配置</h3>
+            ${isHost ? `
+              <button id="btn-auto-recommend-roles" type="button"
+                class="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/30 text-[11px] font-semibold transition">
+                ✨ 依人數推薦配置
+              </button>
+            ` : ""}
+          </div>
+          <p class="text-xs text-slate-400 mb-4">${isHost ? "您是房主，可自由設定 3~20 人、思考秒數與臥底白板數量" : "等待房主調整設定並開始遊戲"}</p>
 
           <!-- 陣營人數即時預覽 -->
-          <div class="grid grid-cols-3 gap-2.5 mb-5">
-            <div class="p-3 rounded-2xl bg-sky-500/10 border border-sky-500/30 text-center">
+          <div class="grid grid-cols-3 gap-2.5 mb-4">
+            <div class="p-2.5 rounded-2xl bg-sky-500/10 border border-sky-500/30 text-center">
               <div class="text-xs text-sky-300">平民人數</div>
               <div class="text-2xl font-extrabold text-white mt-0.5">${civCount}</div>
             </div>
-            <div class="p-3 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-center">
+            <div class="p-2.5 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-center">
               <div class="text-xs text-rose-300">臥底人數</div>
               <div class="text-2xl font-extrabold text-white mt-0.5">${ucCount}</div>
             </div>
-            <div class="p-3 rounded-2xl bg-purple-500/10 border border-purple-500/30 text-center">
+            <div class="p-2.5 rounded-2xl bg-purple-500/10 border border-purple-500/30 text-center">
               <div class="text-xs text-purple-300">白板人數</div>
               <div class="text-2xl font-extrabold text-white mt-0.5">${blankCount}</div>
             </div>
           </div>
 
-          <div class="space-y-4">
-            <!-- 臥底人數調整 -->
+          <div class="space-y-3">
+            <!-- 1. 房間座位人數上限調整 (3~20人) -->
+            <div class="p-3 rounded-2xl bg-slate-950 border border-slate-800">
+              <div class="flex items-center justify-between">
+                <div>
+                  <div class="text-sm font-semibold text-white">👥 房間設定人數 (3~20人)</div>
+                  <div class="text-xs text-slate-400">可自行調整本局預計遊玩座位數</div>
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <button ${!isHost ? "disabled" : ""} data-adj-maxplayers="-1"
+                    class="w-8 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white font-bold">-</button>
+                  <input id="input-max-players" type="number" min="3" max="20" value="${maxPlayers}" ${!isHost ? "disabled" : ""}
+                    class="w-14 py-1 rounded-lg bg-slate-900 border border-slate-700 text-center font-bold text-white text-sm focus:outline-none focus:border-indigo-500" />
+                  <button ${!isHost ? "disabled" : ""} data-adj-maxplayers="1"
+                    class="w-8 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white font-bold">+</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 2. 每人思考/發言秒數設定 -->
+            <div class="p-3 rounded-2xl bg-slate-950 border border-slate-800 space-y-2">
+              <div class="flex items-center justify-between">
+                <div>
+                  <div class="text-sm font-semibold text-white">⏱️ 每人思考/發言秒數</div>
+                  <div class="text-xs text-slate-400">${thinkSec === 0 ? "目前為不限時間" : `每人輪流發言倒數 ${thinkSec} 秒`}</div>
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <button ${!isHost ? "disabled" : ""} data-adj-think="-5"
+                    class="px-2 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white text-xs font-bold">-5s</button>
+                  <input id="input-think-seconds" type="number" min="0" max="300" step="5" value="${thinkSec}" ${!isHost ? "disabled" : ""}
+                    class="w-16 py-1 rounded-lg bg-slate-900 border border-slate-700 text-center font-bold text-amber-300 text-sm focus:outline-none focus:border-indigo-500" />
+                  <button ${!isHost ? "disabled" : ""} data-adj-think="5"
+                    class="px-2 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white text-xs font-bold">+5s</button>
+                </div>
+              </div>
+              ${isHost ? `
+                <div class="flex flex-wrap gap-1.5 pt-1">
+                  ${[
+                    { label: "不限時", val: 0 },
+                    { label: "15秒", val: 15 },
+                    { label: "30秒", val: 30 },
+                    { label: "45秒", val: 45 },
+                    { label: "60秒", val: 60 },
+                    { label: "90秒", val: 90 }
+                  ].map(preset => `
+                    <button type="button" data-preset-think="${preset.val}"
+                      class="px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition ${thinkSec === preset.val ? "bg-amber-400 text-slate-950 border-amber-300" : "bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800"}">
+                      ${preset.label}
+                    </button>
+                  `).join("")}
+                </div>
+              ` : ""}
+            </div>
+
+            <!-- 3. 臥底人數調整 -->
             <div class="flex items-center justify-between p-3 rounded-2xl bg-slate-950 border border-slate-800">
               <div>
                 <div class="text-sm font-semibold text-white">🕵️ 臥底人數</div>
@@ -1120,7 +1367,7 @@ function renderRoomWaitingHtml(room, isHost) {
               </div>
             </div>
 
-            <!-- 白板人數調整 -->
+            <!-- 4. 白板人數調整 -->
             <div class="flex items-center justify-between p-3 rounded-2xl bg-slate-950 border border-slate-800">
               <div>
                 <div class="text-sm font-semibold text-white">🃏 白板人數 (可選)</div>
@@ -1135,7 +1382,7 @@ function renderRoomWaitingHtml(room, isHost) {
               </div>
             </div>
 
-            <!-- 題庫分類選擇 -->
+            <!-- 5. 題庫分類選擇 -->
             <div class="p-3 rounded-2xl bg-slate-950 border border-slate-800">
               <label class="block text-xs font-medium text-slate-400 mb-1.5">📚 抽選題庫範圍（目前共 ${AppState.wordBank.allWords.length} 組）</label>
               <select id="select-room-category" ${!isHost ? "disabled" : ""}
@@ -1152,7 +1399,7 @@ function renderRoomWaitingHtml(room, isHost) {
               </select>
             </div>
 
-            <!-- 淘汰公開身分開關 -->
+            <!-- 6. 淘汰公開身分開關 -->
             <label class="flex items-center justify-between p-3 rounded-2xl bg-slate-950 border border-slate-800 cursor-pointer">
               <div>
                 <div class="text-sm font-semibold text-white">淘汰時公開陣營身分</div>
@@ -1164,15 +1411,15 @@ function renderRoomWaitingHtml(room, isHost) {
           </div>
         </div>
 
-        <div class="mt-6">
+        <div class="mt-5">
           ${isHost ? `
             <button id="btn-start-game" ${count < 3 ? "disabled" : ""}
               class="w-full py-4 px-6 rounded-2xl font-bold text-base shadow-lg transition flex items-center justify-center gap-2 ${count >= 3 ? "bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/30" : "bg-slate-800 text-slate-500 cursor-not-allowed"}">
-              <span>${count >= 3 ? `🎲 開始發牌 (${count} 人局)` : `還差 ${3 - count} 人即可開始 (需 3~8 人)`}</span>
+              <span>${count >= 3 ? `🎲 開始發牌 (${count} 人局)` : `還差 ${3 - count} 人即可開始 (支援 3~20 人)`}</span>
             </button>
           ` : `
             <div class="w-full py-3.5 px-6 rounded-2xl bg-slate-800/80 text-slate-300 text-sm font-medium text-center border border-slate-700">
-              ⏳ 等待房主開始發牌... (${count}/8 人)
+              ⏳ 等待房主開始發牌... (目前 ${count} / ${maxPlayers} 人)
             </div>
           `}
         </div>
@@ -1181,13 +1428,14 @@ function renderRoomWaitingHtml(room, isHost) {
   `;
 }
 
-// 渲染：遊戲進行中（看牌 + 輪流發言 + 即時投票）
+// 渲染：遊戲進行中（看牌 + 輪流發言 + 思考倒數計時 + 即時投票）
 function renderInGameHtml(room, isHost, viewingPlayer) {
   const isBlank = viewingPlayer.role === "BLANK";
   const myWordText = isBlank ? "【白板】無題目" : (viewingPlayer.word || "尚未分配");
   const currentSpeakerId = room.speakingOrder[room.currentSpeakerIdx];
   const currentSpeaker = room.players.find(p => p.id === currentSpeakerId);
   const isMyTurnToSpeak = room.phase === "SPEAKING" && currentSpeakerId === viewingPlayer.id;
+  const thinkSec = parseInt(room.settings.thinkingTimeSeconds ?? 30, 10) || 0;
 
   // 投票候選人過濾（若處於平票 PK，只能投給 PK 候選人）
   const isTiePk = room.voteTieCandidates && room.voteTieCandidates.length > 0;
@@ -1240,20 +1488,46 @@ function renderInGameHtml(room, isHost, viewingPlayer) {
               </span>
             </div>
 
-            <!-- 當前發言者提示 -->
-            <div class="p-3.5 rounded-2xl bg-indigo-500/15 border border-indigo-500/30 mb-4 flex items-center justify-between">
-              <div class="flex items-center gap-2.5">
-                <span class="text-2xl">${currentSpeaker ? escapeHtml(currentSpeaker.avatar) : "🎙️"}</span>
-                <div>
-                  <div class="text-xs text-indigo-300">目前輪到發言：</div>
-                  <div class="text-sm font-bold text-white">${currentSpeaker ? escapeHtml(currentSpeaker.name) : "等待中"}</div>
+            <!-- 當前發言者與思考倒數計時器 -->
+            <div class="p-3.5 rounded-2xl bg-indigo-500/15 border border-indigo-500/30 mb-4 space-y-2.5">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2.5">
+                  <span class="text-2xl">${currentSpeaker ? escapeHtml(currentSpeaker.avatar) : "🎙️"}</span>
+                  <div>
+                    <div class="text-xs text-indigo-300">目前輪到發言：</div>
+                    <div class="text-sm font-bold text-white">${currentSpeaker ? escapeHtml(currentSpeaker.name) : "等待中"}</div>
+                  </div>
                 </div>
+                ${isMyTurnToSpeak ? `
+                  <span class="px-2.5 py-1 rounded-lg bg-amber-400 text-slate-950 text-xs font-extrabold animate-bounce">
+                    輪到您了！
+                  </span>
+                ` : ""}
               </div>
-              ${isMyTurnToSpeak ? `
-                <span class="px-2.5 py-1 rounded-lg bg-amber-400 text-slate-950 text-xs font-extrabold animate-bounce">
-                  輪到您了！
-                </span>
-              ` : ""}
+
+              ${thinkSec > 0 && room.speakerDeadline ? `
+                <div class="pt-1 border-t border-indigo-500/20">
+                  <div class="flex items-center justify-between text-xs mb-1.5">
+                    <span class="text-slate-300 flex items-center gap-1">
+                      ⏱️ 思考與發言倒數：
+                      <strong id="speaker-timer-text" class="text-base font-mono font-extrabold text-amber-300">-- 秒</strong>
+                    </span>
+                    ${(isHost || isMyTurnToSpeak) ? `
+                      <button id="btn-extend-time" type="button"
+                        class="px-2 py-0.5 rounded-md bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/30 text-[11px] font-semibold transition">
+                        +15秒
+                      </button>
+                    ` : ""}
+                  </div>
+                  <div class="w-full h-2 rounded-full bg-slate-950 overflow-hidden">
+                    <div id="speaker-timer-bar" class="h-full bg-gradient-to-r from-emerald-400 to-amber-400 transition-all duration-200" style="width: 100%"></div>
+                  </div>
+                </div>
+              ` : `
+                <div class="text-[11px] text-slate-400 pt-1 border-t border-indigo-500/20">
+                  ⏱️ 本局設定為不限思考時間
+                </div>
+              `}
             </div>
 
             <!-- 發言順序條 -->
@@ -1852,10 +2126,140 @@ function bindLobbyHomeEvents() {
   }
 }
 
+let speakerTimerInterval = null;
+let lastAutoAdvancedDeadline = 0;
+
+function stopSpeakerCountdownTicker() {
+  if (speakerTimerInterval) {
+    clearInterval(speakerTimerInterval);
+    speakerTimerInterval = null;
+  }
+}
+
+function startSpeakerCountdownTicker() {
+  stopSpeakerCountdownTicker();
+  const updateTimerDom = () => {
+    const room = AppState.room;
+    if (!room || room.phase !== "SPEAKING" || !room.speakerDeadline) return;
+
+    const textEl = document.getElementById("speaker-timer-text");
+    const barEl = document.getElementById("speaker-timer-bar");
+    const now = Date.now();
+    const remainMs = Math.max(0, room.speakerDeadline - now);
+    const remainSec = Math.ceil(remainMs / 1000);
+    const totalMs = Math.max(1000, (room.speakerTotalSeconds || room.settings.thinkingTimeSeconds || 30) * 1000);
+    const pct = Math.max(0, Math.min(100, (remainMs / totalMs) * 100));
+
+    if (textEl) {
+      textEl.textContent = `${remainSec} 秒`;
+      if (remainSec <= 5) {
+        textEl.className = "text-base font-mono font-extrabold text-rose-400 animate-pulse";
+      } else if (remainSec <= 10) {
+        textEl.className = "text-base font-mono font-extrabold text-amber-300";
+      } else {
+        textEl.className = "text-base font-mono font-extrabold text-emerald-300";
+      }
+    }
+
+    if (barEl) {
+      barEl.style.width = `${pct}%`;
+      if (remainSec <= 5) {
+        barEl.className = "h-full bg-rose-500 transition-all duration-200";
+      } else {
+        barEl.className = "h-full bg-gradient-to-r from-emerald-400 to-amber-400 transition-all duration-200";
+      }
+    }
+
+    // 時間到時，由房主自動切換至下一位發言者 (或進入投票)
+    if (remainMs <= 0 && room.hostId === AppState.myPlayer.id) {
+      if (lastAutoAdvancedDeadline !== room.speakerDeadline) {
+        lastAutoAdvancedDeadline = room.speakerDeadline;
+        showToast("⏰ 思考時間到！自動切換至下一位", "warning");
+        handleHostAction({ type: "NEXT_SPEAKER" });
+      }
+    }
+  };
+
+  updateTimerDom();
+  speakerTimerInterval = setInterval(updateTimerDom, 200);
+}
+
 function bindRoomEvents() {
   const room = AppState.room;
   if (!room) return;
   const viewingPlayer = getActiveViewingPlayer();
+
+  // 房間內展開/關閉修改個人暱稱與頭像面板
+  const openEditProfile = () => {
+    AppState.isEditingProfileInRoom = !AppState.isEditingProfileInRoom;
+    AppState.roomDraftAvatar = viewingPlayer.avatar;
+    renderApp();
+    if (AppState.isEditingProfileInRoom) {
+      const inp = document.getElementById("input-room-player-name");
+      if (inp) {
+        inp.focus();
+        inp.select();
+      }
+    }
+  };
+
+  const btnToggleProfile = document.getElementById("btn-toggle-room-profile");
+  if (btnToggleProfile) btnToggleProfile.addEventListener("click", openEditProfile);
+
+  const btnQuickEditName = document.getElementById("btn-quick-edit-name");
+  if (btnQuickEditName) btnQuickEditName.addEventListener("click", openEditProfile);
+
+  document.querySelectorAll("[data-open-profile-edit]").forEach(btn => {
+    btn.addEventListener("click", openEditProfile);
+  });
+
+  const btnCancelProfile = document.getElementById("btn-cancel-room-profile");
+  if (btnCancelProfile) {
+    btnCancelProfile.addEventListener("click", () => {
+      AppState.isEditingProfileInRoom = false;
+      renderApp();
+    });
+  }
+
+  document.querySelectorAll("[data-room-avatar-pick]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      AppState.roomDraftAvatar = btn.getAttribute("data-room-avatar-pick");
+      const nameVal = document.getElementById("input-room-player-name")?.value || viewingPlayer.name;
+      renderApp();
+      const inp = document.getElementById("input-room-player-name");
+      if (inp) inp.value = nameVal;
+    });
+  });
+
+  const btnSaveProfile = document.getElementById("btn-save-room-profile");
+  const inputRoomName = document.getElementById("input-room-player-name");
+  if (btnSaveProfile && inputRoomName) {
+    const commitProfileSave = () => {
+      const newName = inputRoomName.value.trim();
+      if (!newName) {
+        showToast("請輸入暱稱", "warning");
+        return;
+      }
+      const newAvatar = AppState.roomDraftAvatar || viewingPlayer.avatar;
+      if (viewingPlayer.id === AppState.myPlayer.id) {
+        savePlayerProfile(newName, newAvatar);
+      } else {
+        window.cloudService.sendActionToHost({
+          type: "UPDATE_PLAYER_PROFILE",
+          playerId: viewingPlayer.id,
+          name: newName,
+          avatar: newAvatar
+        });
+      }
+      AppState.isEditingProfileInRoom = false;
+      renderApp();
+      showToast(`✅ 已將名稱更新為「${newName}」`, "success");
+    };
+    btnSaveProfile.addEventListener("click", commitProfileSave);
+    inputRoomName.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") commitProfileSave();
+    });
+  }
 
   // 複製房間邀請連結
   const btnCopyInvite = document.getElementById("btn-copy-invite");
@@ -1868,16 +2272,21 @@ function bindRoomEvents() {
     });
   }
 
-  // 離開房間
+  // 離開房間 (自動通知房主移除該成員，無需房主手動踢人)
   const btnLeave = document.getElementById("btn-leave-room");
   if (btnLeave) {
-    btnLeave.addEventListener("click", () => {
-      window.cloudService.cleanupRoomConnections();
+    btnLeave.addEventListener("click", async () => {
+      btnLeave.disabled = true;
+      btnLeave.textContent = "離開中...";
+      stopSpeakerCountdownTicker();
+      await window.cloudService.leaveCurrentRoom(AppState.myPlayer.id);
       AppState.room = null;
+      AppState.isEditingProfileInRoom = false;
       const url = new URL(window.location.href);
       url.searchParams.delete("room");
       window.history.replaceState({}, "", url.toString());
       renderApp();
+      showToast("已離開房間", "info");
     });
   }
 
@@ -1891,6 +2300,7 @@ function bindRoomEvents() {
       btn.addEventListener("click", () => {
         if (room.hostId !== AppState.myPlayer.id) return;
         room.phase = "LOBBY";
+        room.speakerDeadline = null;
         window.cloudService.publishRoomState(room);
         renderApp();
       });
@@ -1902,15 +2312,16 @@ function bindRoomEvents() {
     btn.addEventListener("click", () => {
       AppState.viewingPlayerId = btn.getAttribute("data-switch-player");
       AppState.cardRevealed = false;
+      AppState.isEditingProfileInRoom = false;
       renderApp();
     });
   });
 
-  // 新增同機玩家/測試座位
+  // 新增同機玩家/測試座位 (最高支援 20 人)
   const btnAddLocal = document.getElementById("btn-add-local-player");
   if (btnAddLocal) {
     btnAddLocal.addEventListener("click", () => {
-      if (room.players.length >= 8) return;
+      if (room.players.length >= 20) return;
       const seatNum = room.players.length + 1;
       const botPlayer = {
         id: "local_" + Date.now() + "_" + seatNum,
@@ -1929,6 +2340,78 @@ function bindRoomEvents() {
       handleHostAction({ type: "REMOVE_PLAYER", playerId: pid });
     });
   });
+
+  // 調整房間人數上限 (3 ~ 20 人)
+  document.querySelectorAll("[data-adj-maxplayers]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const delta = parseInt(btn.getAttribute("data-adj-maxplayers"), 10);
+      const cur = parseInt(room.settings.maxPlayers, 10) || 8;
+      handleHostAction({
+        type: "UPDATE_SETTINGS",
+        settings: { maxPlayers: Math.max(3, Math.min(20, cur + delta)) }
+      });
+    });
+  });
+
+  const inputMaxPlayers = document.getElementById("input-max-players");
+  if (inputMaxPlayers) {
+    inputMaxPlayers.addEventListener("change", () => {
+      const val = parseInt(inputMaxPlayers.value, 10) || 8;
+      handleHostAction({
+        type: "UPDATE_SETTINGS",
+        settings: { maxPlayers: Math.max(3, Math.min(20, val)) }
+      });
+    });
+  }
+
+  // 調整每人思考秒數
+  document.querySelectorAll("[data-adj-think]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const delta = parseInt(btn.getAttribute("data-adj-think"), 10);
+      const cur = parseInt(room.settings.thinkingTimeSeconds ?? 30, 10) || 0;
+      handleHostAction({
+        type: "UPDATE_SETTINGS",
+        settings: { thinkingTimeSeconds: Math.max(0, Math.min(300, cur + delta)) }
+      });
+    });
+  });
+
+  const inputThinkSec = document.getElementById("input-think-seconds");
+  if (inputThinkSec) {
+    inputThinkSec.addEventListener("change", () => {
+      const val = parseInt(inputThinkSec.value, 10);
+      handleHostAction({
+        type: "UPDATE_SETTINGS",
+        settings: { thinkingTimeSeconds: isNaN(val) ? 30 : Math.max(0, Math.min(300, val)) }
+      });
+    });
+  }
+
+  document.querySelectorAll("[data-preset-think]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const val = parseInt(btn.getAttribute("data-preset-think"), 10) || 0;
+      handleHostAction({
+        type: "UPDATE_SETTINGS",
+        settings: { thinkingTimeSeconds: val }
+      });
+    });
+  });
+
+  // 依目前人數一鍵套用推薦臥底與白板數量
+  const btnAutoRec = document.getElementById("btn-auto-recommend-roles");
+  if (btnAutoRec) {
+    btnAutoRec.addEventListener("click", () => {
+      const rec = getRecommendedRoleCounts(Math.max(3, room.players.length));
+      handleHostAction({
+        type: "UPDATE_SETTINGS",
+        settings: {
+          undercoverCount: rec.undercover,
+          blankCount: rec.blank
+        }
+      });
+      showToast(`✨ 已套用 ${room.players.length} 人局推薦配置：${rec.undercover} 臥底、${rec.blank} 白板`, "info");
+    });
+  }
 
   // 調整臥底與白板人數
   document.querySelectorAll("[data-adj-role]").forEach(btn => {
@@ -1983,6 +2466,17 @@ function bindRoomEvents() {
         });
       }
       renderApp();
+    });
+  }
+
+  // 延長思考時間 +15秒
+  const btnExtendTime = document.getElementById("btn-extend-time");
+  if (btnExtendTime) {
+    btnExtendTime.addEventListener("click", () => {
+      window.cloudService.sendActionToHost({
+        type: "EXTEND_SPEAKER_TIME",
+        seconds: 15
+      });
     });
   }
 
@@ -2248,6 +2742,18 @@ window.addEventListener("DOMContentLoaded", async () => {
     await refreshWordBank();
     renderApp();
   };
+
+  // 當玩家直接關閉分頁或重新整理離開時，自動通知房主移除該玩家
+  const notifyLeaveOnUnload = () => {
+    if (AppState.room && AppState.room.hostId !== AppState.myPlayer.id) {
+      window.cloudService.sendActionToHost({
+        type: "LEAVE_ROOM",
+        playerId: AppState.myPlayer.id
+      });
+    }
+  };
+  window.addEventListener("pagehide", notifyLeaveOnUnload);
+  window.addEventListener("beforeunload", notifyLeaveOnUnload);
 
   renderApp();
 

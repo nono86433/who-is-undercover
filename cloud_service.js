@@ -34,6 +34,7 @@
       this.isHost = false;
       this.peer = null;
       this.clientConnections = new Map(); // peerId -> DataConnection (Host 用)
+      this.peerToPlayerId = new Map();    // peerId -> playerId (Host 追蹤斷線離開用)
       this.hostConnection = null;         // DataConnection (Client 用)
       this.firebasePollTimer = null;
       this.broadcastChannel = null;
@@ -564,13 +565,29 @@
           });
 
           conn.on("data", (data) => {
-            if (data && data.type === "CLIENT_ACTION" && onActionCallback) {
-              onActionCallback(data.action);
+            if (data && data.type === "CLIENT_ACTION") {
+              const act = data.action;
+              if (act) {
+                const pid = (act.player && act.player.id) || act.playerId || act.voterId;
+                if (pid) {
+                  this.peerToPlayerId.set(conn.peer, pid);
+                }
+                if (onActionCallback) {
+                  onActionCallback(act);
+                }
+              }
             }
           });
 
           conn.on("close", () => {
             this.clientConnections.delete(conn.peer);
+            const leftPlayerId = this.peerToPlayerId.get(conn.peer);
+            if (leftPlayerId) {
+              this.peerToPlayerId.delete(conn.peer);
+              if (onActionCallback) {
+                onActionCallback({ type: "LEAVE_ROOM", playerId: leftPlayerId });
+              }
+            }
           });
         });
 
@@ -797,6 +814,17 @@
       };
     }
 
+    async leaveCurrentRoom(playerId) {
+      if (this.currentRoomCode && playerId && !this.isHost) {
+        await this.sendActionToHost({
+          type: "LEAVE_ROOM",
+          playerId
+        });
+        await new Promise(r => setTimeout(r, 150));
+      }
+      this.cleanupRoomConnections();
+    }
+
     cleanupRoomConnections() {
       if (this.firebasePollTimer) {
         clearInterval(this.firebasePollTimer);
@@ -810,6 +838,7 @@
         try { conn.close(); } catch (e) {}
       }
       this.clientConnections.clear();
+      this.peerToPlayerId.clear();
       if (this.peer) {
         try { this.peer.destroy(); } catch (e) {}
         this.peer = null;
